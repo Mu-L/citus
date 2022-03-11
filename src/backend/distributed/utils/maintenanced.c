@@ -112,7 +112,7 @@ static volatile sig_atomic_t got_SIGHUP = false;
 static volatile sig_atomic_t got_SIGTERM = false;
 
 /* set to true when becoming a maintenance daemon */
-static bool IsMaintenanceDaemon = false;
+bool IsMaintenanceDaemon = false;
 
 static void MaintenanceDaemonSigTermHandler(SIGNAL_ARGS);
 static void MaintenanceDaemonSigHupHandler(SIGNAL_ARGS);
@@ -622,6 +622,13 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 			timeout = Min(timeout, deadlockTimeout);
 		}
 
+		/* Periodically persist the logical clock value */
+		if (!RecoveryInProgress())
+		{
+			InvalidateMetadataSystemCache();
+			PersistLocalClockValue(0, (Datum) 0);
+		}
+
 		if (!RecoveryInProgress() && DeferShardDeleteInterval > 0 &&
 			TimestampDifferenceExceeds(lastShardCleanTime, GetCurrentTimestamp(),
 									   DeferShardDeleteInterval))
@@ -967,4 +974,15 @@ MetadataSyncTriggeredCheckAndReset(MaintenanceDaemonDBData *dbData)
 	LWLockRelease(&MaintenanceDaemonControl->lock);
 
 	return metadataSyncTriggered;
+}
+
+
+/*
+ * IsMaintainanceDaemonProcess returns true if the process is
+ * maintenance daemon, false for all other backends.
+ */
+bool
+IsMaintainanceDaemonProcess(void)
+{
+	return IsMaintenanceDaemon;
 }

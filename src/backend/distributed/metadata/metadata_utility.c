@@ -58,6 +58,7 @@
 #include "nodes/makefuncs.h"
 #include "parser/scansup.h"
 #include "storage/lmgr.h"
+#include "storage/ipc.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -2204,4 +2205,26 @@ bool
 IsForeignTable(Oid relationId)
 {
 	return get_rel_relkind(relationId) == RELKIND_FOREIGN_TABLE;
+}
+
+
+/*
+ * RegisterAndAdjustClockValue registers a shared-memory exit callback, which
+ * will persist the current clock value from shared memory to catalog. Calls
+ * routine that initializes and adjusts the clock if needed.
+ */
+void
+RegisterAndAdjustClockValue(void)
+{
+	static bool registeredSaveClock = false;
+
+	/* Avoid repeated initialization */
+	if (registeredSaveClock == true)
+	{
+		return;
+	}
+
+	before_shmem_exit(PersistLocalClockValue, (Datum) 0);
+	AdjustAndInitializeClusterClock();
+	registeredSaveClock = true;
 }
