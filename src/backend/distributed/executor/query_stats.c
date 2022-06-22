@@ -49,7 +49,6 @@
 #define STICKY_DECREASE_FACTOR (0.50)   /* factor for sticky entries */
 #define USAGE_DEALLOC_PERCENT 5         /* free this % of entries at once */
 #define USAGE_INIT (1.0)                /* including initial planning */
-#define STATS_SHARED_MEM_NAME "citus_query_stats"
 
 #define MAX_KEY_LENGTH NAMEDATALEN
 
@@ -124,7 +123,6 @@ PG_FUNCTION_INFO_V1(citus_executor_name);
 
 static char * CitusExecutorName(MultiExecutorType executorType);
 
-static Size CitusQueryStatsSharedMemSize(void);
 
 static void CitusQueryStatsShmemStartup(void);
 static void CitusQueryStatsShmemShutdown(int code, Datum arg);
@@ -143,11 +141,6 @@ static void CitusQueryStatsRemoveExpiredEntries(HTAB *existingQueryIdHash);
 void
 InitializeCitusQueryStats(void)
 {
-	RequestAddinShmemSpace(CitusQueryStatsSharedMemSize());
-
-	elog(LOG, "requesting named LWLockTranch for %s", STATS_SHARED_MEM_NAME);
-	RequestNamedLWLockTranche(STATS_SHARED_MEM_NAME, 1);
-
 	/* Install hook */
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = CitusQueryStatsShmemStartup;
@@ -373,7 +366,7 @@ error:
  * CitusQueryStatsSharedMemSize calculates and returns shared memory size
  * required to keep query statistics.
  */
-static Size
+Size
 CitusQueryStatsSharedMemSize(void)
 {
 	Assert(StatStatementsMax >= 0);
@@ -947,7 +940,7 @@ GetPGStatStatementsMax(void)
 	 */
 	if (pgssMax)
 	{
-		maxValue = pg_atoi(pgssMax, 4, 0);
+		maxValue = pg_strtoint32(pgssMax);
 	}
 
 	return maxValue;

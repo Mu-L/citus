@@ -149,9 +149,11 @@ static int ReplicationModel = REPLICATION_MODEL_STREAMING;
 static GucStringAssignHook OldApplicationNameAssignHook = NULL;
 
 static object_access_hook_type PrevObjectAccessHook = NULL;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
 
 void _PG_init(void);
 
+static void citus_shmem_request(void);
 static void CitusObjectAccessHook(ObjectAccessType access, Oid classId, Oid objectId, int
 								  subId, void *arg);
 static void DoInitialCleanup(void);
@@ -368,6 +370,9 @@ _PG_init(void)
 	original_client_auth_hook = ClientAuthentication_hook;
 	ClientAuthentication_hook = CitusAuthHook;
 
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = citus_shmem_request;
+
 	InitializeMaintenanceDaemon();
 
 	/* initialize coordinated transaction management */
@@ -399,6 +404,7 @@ _PG_init(void)
 
 	PrevObjectAccessHook = object_access_hook;
 	object_access_hook = CitusObjectAccessHook;
+
 
 	/* ensure columnar module is loaded at the right time */
 	load_file(COLUMNAR_MODULE_NAME, false);
@@ -439,6 +445,22 @@ _PG_init(void)
 	INIT_COLUMNAR_SYMBOL(PGFunction, columnar_storage_info);
 	INIT_COLUMNAR_SYMBOL(PGFunction, columnar_store_memory_stats);
 	INIT_COLUMNAR_SYMBOL(PGFunction, test_columnar_storage_write_new_page);
+}
+
+/*
+ * Requests any additional shared memory required for autoprewarm.
+ */
+static void
+citus_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+
+	RequestAddinShmemSpace(BackendManagementShmemSize());
+	RequestAddinShmemSpace(SharedConnectionStatsShmemSize());
+	RequestAddinShmemSpace(MaintenanceDaemonShmemSize());
+	RequestAddinShmemSpace(CitusQueryStatsSharedMemSize());
+	RequestNamedLWLockTranche(STATS_SHARED_MEM_NAME, 1);
 }
 
 
