@@ -658,5 +658,4 @@ DropPolicyEventExtendNames(DropStmt *dropStmt, const char *schemaName, uint64 sh
 
 	char **relationName = &(strVal(relationNameValue));
 	AppendShardIdToName(relationName, shardId);
-
 }

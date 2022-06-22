@@ -447,6 +447,7 @@ _PG_init(void)
 	INIT_COLUMNAR_SYMBOL(PGFunction, test_columnar_storage_write_new_page);
 }
 
+
 /*
  * Requests any additional shared memory required for autoprewarm.
  */
@@ -454,7 +455,9 @@ static void
 citus_shmem_request(void)
 {
 	if (prev_shmem_request_hook)
+	{
 		prev_shmem_request_hook();
+	}
 
 	RequestAddinShmemSpace(BackendManagementShmemSize());
 	RequestAddinShmemSpace(SharedConnectionStatsShmemSize());
