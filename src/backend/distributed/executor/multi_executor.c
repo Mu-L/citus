@@ -364,7 +364,7 @@ FetchNextScanTuple(CitusScanState *scanState, bool forward, TupleTableSlot *slot
 		 * the adapter cannot satisfy it. Report a user-facing error
 		 * rather than crashing.
 		 */
-		if (!forward)
+		if (unlikely(!forward))
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

@@ -151,14 +151,20 @@ AssignPerTaskDispatchDests(List *taskList, TupleDesc tupleDesc,
 	 * Allocate per-task tuple stores. Each store gets work_mem / taskCount,
 	 * with a floor of 64 kB. Note: this means the aggregate in-memory budget
 	 * for per-task stores can exceed a single work_mem allocation when
-	 * taskCount is large (e.g., 128 tasks × 64 kB = 8 MB floor). The final
-	 * output tuplestore also gets a full work_mem allocation. This is a
-	 * deliberate trade-off: per-task stores spill to disk automatically,
-	 * and they are freed before the final tuplestore is consumed. The
-	 * temporary memory amplification is bounded and short-lived.
+	 * taskCount is large (e.g. 128 tasks × 64 kB = 8 MB floor). This is a
+	 * deliberate trade-off: per-task stores spill to disk automatically
+	 * once their portion of work_mem is exhausted, and the streaming merge
+	 * adapter consumes them tuple-by-tuple, so the working set stays bounded.
+	 * The temporary memory amplification is bounded and short-lived.
 	 */
 	Tuplestorestate **perTaskStores = palloc(taskCount * sizeof(Tuplestorestate *));
 	int perTaskWorkMem = Max(work_mem / Max(taskCount, 1), 64);
+
+	ereport(DEBUG2,
+			(errmsg("sorted merge: per-task work_mem %d kB × %d tasks "
+					"(aggregate floor %d kB), session work_mem %d kB",
+					perTaskWorkMem, taskCount,
+					perTaskWorkMem * taskCount, work_mem)));
 
 	int i = 0;
 	Task *task = NULL;
@@ -201,7 +207,9 @@ ClearPerTaskDispatchDests(List *taskList)
  * Returns negative if a < b, positive if a > b, zero if equal.
  * The binary heap is a max-heap, so we negate to get min-heap behavior.
  *
- * This is modeled after heap_compare_slots() in nodeMergeAppend.c.
+ * When all sort keys compare equal, ties are broken by store (slot) index so
+ * that the relative order of equal-key rows is stable within a single
+ * execution.
  */
 static int
 MergeHeapComparator(Datum a, Datum b, void *arg)
@@ -231,7 +239,7 @@ MergeHeapComparator(Datum a, Datum b, void *arg)
 		}
 	}
 
-	return 0;
+	return (slot1 <= slot2) ? 1 : -1;
 }
 
 
@@ -452,8 +460,20 @@ FinalizeSortedMerge(CitusScanState *scanState,
 							 workerJob->jobQuery->targetList,
 							 &sortedMergeKeyCount);
 
-	/* Plan-time eligibility gate guarantees this; assert defensively. */
-	Assert(sortedMergeKeyCount > 0);
+	/*
+	 * The plan-time eligibility gate guarantees we have at least one sort
+	 * key when sorted merge is active. Defend against a corrupted plan in
+	 * release builds: a zero-key adapter would crash later in
+	 * PrepareSortSupportFromOrderingOp / ApplySortComparator.
+	 */
+	if (sortedMergeKeyCount == 0)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("sorted merge: worker query has no sort keys"),
+				 errhint("This is an internal Citus invariant violation. "
+						 "Disable citus.enable_sorted_merge as a workaround.")));
+	}
 
 	scanState->mergeAdapter = CreateSortedMergeAdapter(perTaskStores,
 													   perTaskStoreCount,

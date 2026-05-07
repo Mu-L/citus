@@ -66,6 +66,7 @@ FROM test a
 WHERE x IN (SELECT x FROM test b UNION SELECT y FROM test c WHERE a.x = c.x)
 ORDER BY 1,2;
 DEBUG:  Router planner cannot handle multi-shard select queries
+DEBUG:  sorted merge: per-task work_mem 2048 kB × 2 tasks (aggregate floor 4096 kB), session work_mem 4096 kB
  x | y
 ---------------------------------------------------------------------
  1 | 1
@@ -106,6 +107,7 @@ SELECT a.*
 FROM test a JOIN LATERAL (SELECT x FROM test b UNION SELECT y FROM test c WHERE a.x = c.x) dt1 ON a.x = dt1.x
 ORDER BY 1,2;
 DEBUG:  Router planner cannot handle multi-shard select queries
+DEBUG:  sorted merge: per-task work_mem 2048 kB × 2 tasks (aggregate floor 4096 kB), session work_mem 4096 kB
  x | y
 ---------------------------------------------------------------------
  1 | 1
