@@ -40,12 +40,8 @@ typedef struct SortedMergeKey
 extern SortedMergeKey * BuildSortedMergeKeys(List *sortClauseList,
 											 List *targetList, int *nkeys);
 
-extern void AssignPerTaskDispatchDests(List *taskList,
-									   TupleDesc tupleDesc,
-									   TupleDestinationStats *sharedStats,
-									   Tuplestorestate ***perTaskStoresOut,
-									   int *perTaskStoreCountOut);
-extern void ClearPerTaskDispatchDests(List *taskList);
+extern void CreatePerTaskDispatchDests(CitusScanState *scanState);
+extern void ClearPerTaskDispatchDests(CitusScanState *scanState);
 
 extern SortedMergeAdapter * CreateSortedMergeAdapter(Tuplestorestate **perTaskStores,
 													 int nstores,
@@ -56,19 +52,5 @@ extern SortedMergeAdapter * CreateSortedMergeAdapter(Tuplestorestate **perTaskSt
 extern TupleTableSlot * SortedMergeAdapterNext(SortedMergeAdapter *adapter);
 extern void SortedMergeAdapterRescan(SortedMergeAdapter *adapter);
 extern void FreeSortedMergeAdapter(SortedMergeAdapter *adapter);
-
-/*
- * FinalizeSortedMerge performs the post-execution k-way merge of pre-sorted
- * per-task worker results by attaching a streaming SortedMergeAdapter to
- * scanState->mergeAdapter. The adapter takes ownership of the per-task
- * stores and is freed by CitusEndScan via FreeSortedMergeAdapter.
- *
- * No-op if perTaskStoreCount == 0 (e.g. no remote tasks executed).
- */
-extern void FinalizeSortedMerge(CitusScanState *scanState,
-								Job *workerJob,
-								Tuplestorestate **perTaskStores,
-								int perTaskStoreCount,
-								TupleDesc tupleDescriptor);
 
 #endif /* SORTED_MERGE_H */

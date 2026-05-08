@@ -318,13 +318,14 @@ typedef struct DistributedExecution
 	bool localExecutionSupported;
 
 	/*
-	 * Sorted merge: when useSortedMerge is true, worker results are routed
-	 * to per-task tuple stores. After execution completes, these stores are
-	 * k-way merged into the final scanState->tuplestorestate.
+	 * Sorted merge: when useSortedMerge is true, CreatePerTaskDispatchDests
+	 * has already attached a streaming SortedMergeAdapter to
+	 * scanState->mergeAdapter; the per-task tuple stores are owned by that
+	 * adapter, so we do not carry them on the execution struct. Worker
+	 * results are routed into the stores via task->tupleDest as the workers
+	 * run, and the executor reads from the adapter on first fetch.
 	 */
 	bool useSortedMerge;
-	Tuplestorestate **perTaskStores;
-	int perTaskStoreCount;
 } DistributedExecution;
 
 
@@ -652,9 +653,7 @@ static DistributedExecution * CreateDistributedExecution(RowModifyLevel modLevel
 														 xactProperties,
 														 List *jobIdList,
 														 bool localExecutionSupported,
-														 bool useSortedMerge,
-														 Tuplestorestate **perTaskStores,
-														 int perTaskStoreCount);
+														 bool useSortedMerge);
 static TransactionProperties DecideTaskListTransactionProperties(RowModifyLevel
 																 modLevel,
 																 List *taskList,
@@ -817,8 +816,7 @@ AdaptiveExecutor(CitusScanState *scanState)
 
 	/*
 	 * When sorted merge is active, route worker results into per-task tuple
-	 * stores. After execution completes, these stores are k-way merged into
-	 * the final scanState->tuplestorestate.
+	 * stores.
 	 *
 	 * useSortedMerge is a plan-time decision — if the plan says merge, the
 	 * executor must merge, because the combine query plan has no Sort node
@@ -830,18 +828,13 @@ AdaptiveExecutor(CitusScanState *scanState)
 	 * tuples (queryNumber == 1) are handled entirely within
 	 * ExplainAnalyzeDestPutTuple and never reach the per-task dispatch.
 	 */
-	Tuplestorestate **perTaskStores = NULL;
-	int perTaskStoreCount = 0;
-
 	if (distributedPlan->useSortedMerge)
 	{
-		ClearPerTaskDispatchDests(taskList);
+		ClearPerTaskDispatchDests(scanState);
 
-		TupleDestinationStats *sharedStats = palloc0(sizeof(TupleDestinationStats));
-		AssignPerTaskDispatchDests(taskList, tupleDescriptor, sharedStats,
-								   &perTaskStores, &perTaskStoreCount);
+		CreatePerTaskDispatchDests(scanState);
 
-		/* final tuplestore created after merge */
+		/* tuples are produced by the merge adapter, not a final tuplestore */
 		scanState->tuplestorestate = NULL;
 	}
 	else
@@ -912,9 +905,7 @@ AdaptiveExecutor(CitusScanState *scanState)
 		&xactProperties,
 		jobIdList,
 		localExecutionSupported,
-		distributedPlan->useSortedMerge,
-		perTaskStores,
-		perTaskStoreCount);
+		distributedPlan->useSortedMerge);
 
 	/*
 	 * Make sure that we acquire the appropriate locks even if the local tasks
@@ -947,17 +938,16 @@ AdaptiveExecutor(CitusScanState *scanState)
 	FinishDistributedExecution(execution);
 
 	/*
-	 * When sorted merge is active, k-way merge the per-task stores either
-	 * into a final tuplestore (eager mode) or into a streaming adapter
-	 * (streaming mode). Both modes are encapsulated in FinalizeSortedMerge
-	 * so this site does not branch on the merge mode.
+	 * When sorted merge is active, scrub per-task tupleDest pointers off
+	 * the canonical task list. The streaming merge adapter (already
+	 * attached to scanState->mergeAdapter by CreatePerTaskDispatchDests)
+	 * keeps producing tuples lazily; we just have to clean up the cached
+	 * task pointers so that re-execution of a prepared plan never sees
+	 * stale state.
 	 */
 	if (execution->useSortedMerge)
 	{
-		FinalizeSortedMerge(scanState, job, execution->perTaskStores,
-							execution->perTaskStoreCount, tupleDescriptor);
-
-		ClearPerTaskDispatchDests(job->taskList);
+		ClearPerTaskDispatchDests(scanState);
 	}
 
 	if (SortReturning && distributedPlan->expectResults && commandType != CMD_SELECT)
@@ -1169,7 +1159,7 @@ ExecuteTaskListExtended(ExecutionParams *executionParams)
 			executionParams->paramListInfo, executionParams->targetPoolSize,
 			defaultTupleDest, &executionParams->xactProperties,
 			executionParams->jobIdList, executionParams->localExecutionSupported,
-			false, NULL, 0);
+			false);
 
 	/*
 	 * If current transaction accessed local placements and task list includes
@@ -1235,9 +1225,7 @@ CreateDistributedExecution(RowModifyLevel modLevel, List *taskList,
 						   int targetPoolSize, TupleDestination *defaultTupleDest,
 						   TransactionProperties *xactProperties,
 						   List *jobIdList, bool localExecutionSupported,
-						   bool useSortedMerge,
-						   Tuplestorestate **perTaskStores,
-						   int perTaskStoreCount)
+						   bool useSortedMerge)
 {
 	DistributedExecution *execution =
 		(DistributedExecution *) palloc0(sizeof(DistributedExecution));
@@ -1268,8 +1256,6 @@ CreateDistributedExecution(RowModifyLevel modLevel, List *taskList,
 	execution->localExecutionSupported = localExecutionSupported;
 
 	execution->useSortedMerge = useSortedMerge;
-	execution->perTaskStores = perTaskStores;
-	execution->perTaskStoreCount = perTaskStoreCount;
 
 	/*
 	 * Since task can have multiple queries, we are not sure how many columns we should

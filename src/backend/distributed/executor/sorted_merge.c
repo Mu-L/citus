@@ -3,7 +3,7 @@
  * sorted_merge.c
  *	  Implements coordinator-side sorted merge of pre-sorted worker results.
  *
- *	  AssignPerTaskDispatchDests() creates one tuplestore per task and assigns
+ *	  CreatePerTaskDispatchDests() creates one tuplestore per task and assigns
  *	  task->tupleDest to a TupleStoreTupleDest pointing at that store. The
  *	  executor then routes each worker result tuple directly via the task's
  *	  tupleDest, with no hash-table indirection. All per-task tupleDests
@@ -114,36 +114,44 @@ BuildSortedMergeKeys(List *sortClauseList, List *targetList, int *nkeys)
 
 
 /*
- * AssignPerTaskDispatchDests creates one tuple store per task and sets
+ * CreatePerTaskDispatchDests creates one tuple store per task, sets
  * task->tupleDest to a TupleStoreTupleDest that writes directly to that
- * store. All per-task destinations share a single TupleDestinationStats
- * (sharedStats) so that citus.max_intermediate_result_size is enforced
- * against the sum of bytes across tasks, not per task.
+ * store, and attaches a SortedMergeAdapter to scanState->mergeAdapter so
+ * the executor can read globally-sorted tuples lazily after the workers
+ * fill the stores.
  *
- * The per-task store array (parallel to taskList iteration order) is
- * returned via *perTaskStoresOut; the merge code consumes it in the same
- * 0..k-1 order. The hot dispatch path is therefore task->tupleDest->putTuple
- * (TupleStoreTupleDestPutTuple), with no hash-table lookup.
+ * All per-task destinations share a single TupleDestinationStats so that
+ * citus.max_intermediate_result_size is enforced against the sum of bytes
+ * across tasks, not per task.
+ *
+ * The hot dispatch path is task->tupleDest->putTuple
+ * (TupleStoreTupleDestPutTuple), with no hash-table lookup. The adapter
+ * reads from the same stores in 0..k-1 task order on first fetch.
  *
  * Caller responsibilities:
- *   - taskList must be the canonical Job->taskList; mutations to
+ *   - The scan's task list is the canonical Job->taskList; mutations to
  *     task->tupleDest are visible across cached prepared-plan executions
  *     and must be cleared via ClearPerTaskDispatchDests() at execution
  *     start AND end. AdaptiveExecutor handles this.
- *   - All allocations live in CurrentMemoryContext (the AdaptiveExecutor
- *     local context), and become invalid when that context is freed.
+ *   - All allocations (per-task stores, adapter, slots, heap) live in
+ *     CurrentMemoryContext (the AdaptiveExecutor local context), and
+ *     become invalid when that context is freed. The adapter additionally
+ *     owns the stores and ends them via FreeSortedMergeAdapter, called
+ *     from CitusEndScan when the scan terminates.
+ *
+ * No-op (mergeAdapter remains NULL) if the task list is empty — e.g. a
+ * plan whose tasks were all pruned to no remote work.
  */
 void
-AssignPerTaskDispatchDests(List *taskList, TupleDesc tupleDesc,
-						   TupleDestinationStats *sharedStats,
-						   Tuplestorestate ***perTaskStoresOut,
-						   int *perTaskStoreCountOut)
+CreatePerTaskDispatchDests(CitusScanState *scanState)
 {
+	Job *workerJob = scanState->distributedPlan->workerJob;
+	List *taskList = workerJob->taskList;
+	TupleDesc tupleDesc = ScanStateGetTupleDescriptor(scanState);
+
 	int taskCount = list_length(taskList);
 	if (taskCount == 0)
 	{
-		*perTaskStoresOut = NULL;
-		*perTaskStoreCountOut = 0;
 		return;
 	}
 
@@ -166,6 +174,8 @@ AssignPerTaskDispatchDests(List *taskList, TupleDesc tupleDesc,
 					perTaskWorkMem, taskCount,
 					perTaskWorkMem * taskCount, work_mem)));
 
+	TupleDestinationStats *sharedStats = palloc0(sizeof(TupleDestinationStats));
+
 	int i = 0;
 	Task *task = NULL;
 	foreach_declared_ptr(task, taskList)
@@ -177,23 +187,56 @@ AssignPerTaskDispatchDests(List *taskList, TupleDesc tupleDesc,
 		i++;
 	}
 
-	*perTaskStoresOut = perTaskStores;
-	*perTaskStoreCountOut = taskCount;
+	/*
+	 * Build the streaming merge adapter now, before execution starts. The
+	 * adapter caches the per-task store array and the heap/slot/sort-key
+	 * scaffolding; lazy seeding (reading the first tuple from each store)
+	 * happens on the first fetch from SortedMergeAdapterNext, after the
+	 * workers have filled the stores.
+	 */
+	int sortedMergeKeyCount = 0;
+	SortedMergeKey *sortedMergeKeys =
+		BuildSortedMergeKeys(workerJob->jobQuery->sortClause,
+							 workerJob->jobQuery->targetList,
+							 &sortedMergeKeyCount);
+
+	/*
+	 * The plan-time eligibility gate guarantees we have at least one sort
+	 * key when sorted merge is active. Defend against a corrupted plan in
+	 * release builds: a zero-key adapter would crash later in
+	 * PrepareSortSupportFromOrderingOp / ApplySortComparator.
+	 */
+	if (sortedMergeKeyCount == 0)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("sorted merge: worker query has no sort keys"),
+				 errhint("This is an internal Citus invariant violation. "
+						 "Disable citus.enable_sorted_merge as a workaround.")));
+	}
+
+	scanState->mergeAdapter = CreateSortedMergeAdapter(perTaskStores,
+													   taskCount,
+													   sortedMergeKeys,
+													   sortedMergeKeyCount,
+													   tupleDesc,
+													   true);
 }
 
 
 /*
  * ClearPerTaskDispatchDests resets task->tupleDest to NULL for every task
- * in taskList. Used to scrub execution-local pointers off the canonical
- * (cached) task list at the start and end of every AdaptiveExecutor()
- * invocation, so that re-execution of a cached prepared plan never sees
- * a stale pointer into a freed memory context.
+ * in the scan's plan task list. Used to scrub execution-local pointers off
+ * the canonical (cached) task list at the start and end of every
+ * AdaptiveExecutor() invocation, so that re-execution of a cached prepared
+ * plan never sees a stale pointer into a freed memory context.
  *
  * Safe to call on tasks that already have tupleDest == NULL.
  */
 void
-ClearPerTaskDispatchDests(List *taskList)
+ClearPerTaskDispatchDests(CitusScanState *scanState)
 {
+	List *taskList = scanState->distributedPlan->workerJob->taskList;
 	Task *task = NULL;
 	foreach_declared_ptr(task, taskList)
 	{
@@ -376,6 +419,11 @@ SortedMergeAdapterNext(SortedMergeAdapter *adapter)
 void
 SortedMergeAdapterRescan(SortedMergeAdapter *adapter)
 {
+	/* TEMPORARY: confirm the rescan path is exercised by tests */
+	ereport(DEBUG2,
+			(errmsg("sorted merge: SortedMergeAdapterRescan invoked over %d stores",
+					adapter->nstores)));
+
 	binaryheap_reset(adapter->heap);
 
 	for (int i = 0; i < adapter->nstores; i++)
@@ -427,58 +475,4 @@ FreeSortedMergeAdapter(SortedMergeAdapter *adapter)
 
 	/* mergeCtx is embedded in adapter, freed with the adapter itself */
 	pfree(adapter);
-}
-
-
-/*
- * FinalizeSortedMerge performs the post-execution k-way merge of pre-sorted
- * per-task worker results by attaching a streaming SortedMergeAdapter to
- * scanState->mergeAdapter. The adapter takes ownership of the per-task
- * stores and is freed (along with the stores) by CitusEndScan via
- * FreeSortedMergeAdapter.
- *
- * Returns immediately when perTaskStoreCount == 0 (e.g. no remote tasks
- * executed). The plan-time eligibility gate guarantees workerJob->jobQuery
- * has at least one sort clause when this function is called with stores
- * present; we assert this defensively.
- */
-void
-FinalizeSortedMerge(CitusScanState *scanState,
-					Job *workerJob,
-					Tuplestorestate **perTaskStores,
-					int perTaskStoreCount,
-					TupleDesc tupleDescriptor)
-{
-	if (perTaskStoreCount == 0)
-	{
-		return;
-	}
-
-	int sortedMergeKeyCount = 0;
-	SortedMergeKey *sortedMergeKeys =
-		BuildSortedMergeKeys(workerJob->jobQuery->sortClause,
-							 workerJob->jobQuery->targetList,
-							 &sortedMergeKeyCount);
-
-	/*
-	 * The plan-time eligibility gate guarantees we have at least one sort
-	 * key when sorted merge is active. Defend against a corrupted plan in
-	 * release builds: a zero-key adapter would crash later in
-	 * PrepareSortSupportFromOrderingOp / ApplySortComparator.
-	 */
-	if (sortedMergeKeyCount == 0)
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("sorted merge: worker query has no sort keys"),
-				 errhint("This is an internal Citus invariant violation. "
-						 "Disable citus.enable_sorted_merge as a workaround.")));
-	}
-
-	scanState->mergeAdapter = CreateSortedMergeAdapter(perTaskStores,
-													   perTaskStoreCount,
-													   sortedMergeKeys,
-													   sortedMergeKeyCount,
-													   tupleDescriptor,
-													   true);
 }
