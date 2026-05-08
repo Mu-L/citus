@@ -907,8 +907,277 @@ SELECT public.explain_filter('EXPLAIN (ANALYZE ON, VERBOSE ON, COSTS OFF, TIMING
 SET citus.enable_sorted_merge TO off;
 
 -- =================================================================
--- Cleanup
+-- Category M: Additional cursor backward-scan coverage (Phase B / T13)
+--
+-- The streaming adapter's "if (unlikely(!forward))" guard in
+-- FetchNextScanTuple() is defensive — the planner drops
+-- CUSTOMPATH_SUPPORT_BACKWARD_SCAN for sorted-merge plans and inserts
+-- a Material node above SCROLL cursors, so PostgreSQL's portal layer
+-- intercepts FETCH BACKWARD on non-SCROLL cursors before reaching us.
+-- These tests document the resulting user-visible behavior.
 -- =================================================================
+
+SET citus.enable_sorted_merge TO on;
+
+-- M1: FETCH PRIOR on a non-SCROLL cursor must also error
+BEGIN;
+DECLARE prior_cursor CURSOR FOR SELECT id FROM sorted_merge_test ORDER BY id;
+FETCH 2 FROM prior_cursor;
+FETCH PRIOR FROM prior_cursor;
+ROLLBACK;
+
+-- M2: FETCH ABSOLUTE 0 (rewind to start) on non-SCROLL must error
+BEGIN;
+DECLARE abs_cursor CURSOR FOR SELECT id FROM sorted_merge_test ORDER BY id;
+FETCH 2 FROM abs_cursor;
+FETCH ABSOLUTE 0 FROM abs_cursor;
+ROLLBACK;
+
+-- M3: SCROLL cursor with FETCH PRIOR / FETCH ABSOLUTE — Material node
+-- above the CustomScan serves the backward fetches transparently.
+BEGIN;
+DECLARE scroll_cur SCROLL CURSOR FOR SELECT id FROM sorted_merge_test ORDER BY id;
+FETCH 3 FROM scroll_cur;
+FETCH PRIOR FROM scroll_cur;
+FETCH ABSOLUTE 1 FROM scroll_cur;
+FETCH LAST FROM scroll_cur;
+CLOSE scroll_cur;
+COMMIT;
+
+-- =================================================================
+-- Category N: SortedMergeAdapterRescan() reachability (Phase B / T17)
+--
+-- This category preserves the SQL shape that DOES drive PG's
+-- ExecutorRewind path on a sorted-merge plan: a SCROLL CURSOR WITH
+-- HOLD that is partially fetched, then committed.
+--
+-- IMPORTANT — in production this query does *not* actually invoke
+-- SortedMergeAdapterRescan().  Citus' planner inserts a Material
+-- node above sorted-merge SCROLL plans via materialize_finished_plan()
+-- in distributed_planner.c, and Material's ExecReScan rewinds its own
+-- tuplestore without descending to the Citus custom scan.  See
+-- rescan_experiments.md for the full investigation.
+--
+-- We keep the test here for two reasons:
+--   1. It documents the SQL shape that exercises the SCROLL HOLD code
+--      path in PG, which is the only PG entry point that calls
+--      ExecutorRewind() on a portal plan tree.
+--   2. If the Material insertion is ever changed (or a future PG
+--      version routes WITH HOLD differently), this test will start
+--      driving SortedMergeAdapterRescan() and any breakage there will
+--      surface in the regression diff.
+--
+-- The expected behavior here is forward-only: FETCH 3 returns the
+-- first three rows; COMMIT persists the cursor (Material absorbs the
+-- rescan); FETCH 3 returns the next three rows from the holdStore.
+-- =================================================================
+
+SET citus.enable_sorted_merge TO on;
+
+-- N1: SCROLL CURSOR WITH HOLD + partial fetch + COMMIT.
+-- This is the only SQL pattern that puts PG on the path to invoking
+-- our rescan callback (PersistHoldablePortal calls ExecutorRewind
+-- iff CURSOR_OPT_SCROLL is set).  Material above us absorbs the
+-- rescan in production; the test still exercises the BeginScan ->
+-- forward drain -> Material persistence -> Free lifecycle and
+-- documents the exact shape that the patch-out experiment showed
+-- can drive SortedMergeAdapterRescan when Material is removed.
+BEGIN;
+DECLARE rescan_cur SCROLL CURSOR WITH HOLD FOR
+    SELECT id FROM sorted_merge_test ORDER BY id LIMIT 10;
+FETCH 3 FROM rescan_cur;
+COMMIT;
+FETCH 3 FROM rescan_cur;
+CLOSE rescan_cur;
+
+-- N1-EXPLAIN: Plan shape for the SCROLL HOLD source query.  The
+-- "Materialize" node above the Custom Scan is the absorber that
+-- prevents SortedMergeAdapterRescan from firing during COMMIT.  When
+-- this node disappears (e.g. the materialize_finished_plan call is
+-- removed for testing), the rescan callback fires as designed.
+SELECT public.explain_filter('EXPLAIN (COSTS OFF, VERBOSE OFF)
+    DECLARE rescan_cur SCROLL CURSOR WITH HOLD FOR
+        SELECT id FROM sorted_merge_test ORDER BY id LIMIT 10');
+
+-- =================================================================
+-- Category O: work_mem stress (Phase B / T18)
+--
+-- Per-task tuplestores have a 64 kB floor; with many tasks the
+-- aggregate budget can exceed work_mem.  These tests force per-task
+-- spill-to-disk (work_mem = 64 kB → each store gets exactly the
+-- floor) and verify correctness under memory pressure.
+--
+-- We surface the DEBUG2 message emitted by AssignPerTaskDispatchDests()
+-- so the test output includes the per-task / aggregate / session
+-- work_mem report.  We use SET LOCAL inside a transaction so the
+-- message level scrubs back to its default afterwards.
+-- =================================================================
+
+SET citus.enable_sorted_merge TO on;
+
+-- O1: First and last rows must match the unstressed sort.  Both
+-- queries activate sorted merge (Merge Method line in EXPLAIN below).
+-- The DEBUG2 line printed before each result confirms the per-task
+-- budget actually drops to the 64 kB floor under tight work_mem.
+BEGIN;
+SET LOCAL work_mem TO '64kB';
+SET LOCAL client_min_messages TO DEBUG2;
+SELECT id FROM sorted_merge_test ORDER BY id LIMIT 5;
+SELECT id FROM sorted_merge_test ORDER BY id DESC LIMIT 5;
+COMMIT;
+
+-- O1-EXPLAIN: Plans for the LIMIT 5 ASC/DESC cases under tight
+-- work_mem — confirms LIMIT pushdown is unaffected by the memory
+-- setting and that "Merge Method: sorted merge" still appears.
+BEGIN;
+SET LOCAL work_mem TO '64kB';
+SELECT public.explain_filter('EXPLAIN (COSTS OFF, VERBOSE OFF)
+    SELECT id FROM sorted_merge_test ORDER BY id LIMIT 5');
+SELECT public.explain_filter('EXPLAIN (COSTS OFF, VERBOSE OFF)
+    SELECT id FROM sorted_merge_test ORDER BY id DESC LIMIT 5');
+COMMIT;
+
+-- =================================================================
+-- Category P: Window functions and COLLATE (Phase B / T21)
+--
+-- Window functions over distributed tables and explicit collations
+-- in ORDER BY both must propagate correctly to worker queries.
+-- =================================================================
+
+SET citus.enable_sorted_merge TO on;
+
+-- P1: row_number() with global window — global windows are NOT
+-- pushable, so this disables sorted merge by the planner eligibility
+-- gate.  Test confirms result correctness.
+SELECT id, row_number() OVER (ORDER BY id) AS rn
+FROM sorted_merge_test
+WHERE id <= 5
+ORDER BY id;
+
+-- P2: EXPLAIN — for a global window, the coordinator Sort + WindowAgg
+-- sits above a non-merging Citus scan (no "Merge Method: sorted merge").
+-- This documents the planner's correct rejection of merge eligibility
+-- when a non-pushable window is present.
+SELECT public.explain_filter('EXPLAIN (COSTS OFF, VERBOSE OFF)
+    SELECT id, row_number() OVER (ORDER BY id) AS rn
+    FROM sorted_merge_test
+    ORDER BY id LIMIT 5');
+
+-- P2b: row_number() with PARTITION BY on the distribution column —
+-- this is a pushable window and sorted merge SHOULD activate.
+SELECT public.explain_filter('EXPLAIN (COSTS OFF, VERBOSE OFF)
+    SELECT id, row_number() OVER (PARTITION BY id ORDER BY val) AS rn
+    FROM sorted_merge_test
+    ORDER BY id LIMIT 5');
+
+-- P3: Explicit COLLATE "C" in ORDER BY — collation must propagate to
+-- the worker SortSupport so the on-coordinator k-way merge agrees
+-- with the worker-side sort order.
+SELECT val
+FROM sorted_merge_test
+WHERE val IS NOT NULL
+ORDER BY val COLLATE "C"
+LIMIT 5;
+
+-- P4: COLLATE "C" combined with multi-column ORDER BY
+SELECT id, val
+FROM sorted_merge_test
+WHERE val IS NOT NULL
+ORDER BY val COLLATE "C", id
+LIMIT 5;
+
+-- =================================================================
+-- Category Q: onurctirtir review checklist (Phase B / B5)
+--
+-- Coverage for queries called out in the top-level review:
+-- INSERT…SELECT…ORDER BY…LIMIT, router queries, dropped columns,
+-- zero-output-column SELECT, LIMIT 0, single-shard table.
+-- =================================================================
+
+SET citus.enable_sorted_merge TO on;
+
+-- Q1: INSERT … SELECT … ORDER BY … LIMIT
+-- Sorted merge is plan-time; the SELECT subplan should still produce
+-- correctly ordered tuples for the INSERT to consume.
+CREATE TABLE sorted_merge_target (id int, val text);
+SELECT create_distributed_table('sorted_merge_target', 'id');
+
+INSERT INTO sorted_merge_target
+SELECT id, val FROM sorted_merge_test
+WHERE id IS NOT NULL
+ORDER BY id, val
+LIMIT 5;
+
+SELECT id, val FROM sorted_merge_target ORDER BY id, val;
+DROP TABLE sorted_merge_target;
+
+-- Q2: Router (single-shard) query — should bypass sorted merge.
+-- The SELECT runs on a single shard, so there is no k-way merge and
+-- EXPLAIN must NOT show "Merge Method: sorted merge".
+SELECT public.explain_filter('EXPLAIN (COSTS OFF, VERBOSE OFF)
+    SELECT id, val FROM sorted_merge_test
+    WHERE id = 1
+    ORDER BY id, val LIMIT 5');
+
+SELECT id, val FROM sorted_merge_test
+WHERE id = 1
+ORDER BY id, val LIMIT 5;
+
+-- Q3: Tables with dropped columns — important regression case.
+-- After ALTER TABLE DROP COLUMN, attribute numbers in the worker
+-- output must still align with SortedMergeKey.attno.
+CREATE TABLE sorted_merge_dropcol (
+    drop_a int,
+    id int,
+    drop_b text,
+    val text,
+    drop_c numeric
+);
+SELECT create_distributed_table('sorted_merge_dropcol', 'id');
+
+INSERT INTO sorted_merge_dropcol (drop_a, id, drop_b, val, drop_c)
+SELECT i * 10, i, 'pre_' || i, 'val_' || i, (i * 0.5)::numeric
+FROM generate_series(1, 20) i;
+
+ALTER TABLE sorted_merge_dropcol DROP COLUMN drop_a;
+ALTER TABLE sorted_merge_dropcol DROP COLUMN drop_b;
+ALTER TABLE sorted_merge_dropcol DROP COLUMN drop_c;
+
+SELECT id, val FROM sorted_merge_dropcol ORDER BY id LIMIT 5;
+SELECT id, val FROM sorted_merge_dropcol ORDER BY val, id LIMIT 5;
+
+SELECT public.explain_filter('EXPLAIN (COSTS OFF, VERBOSE OFF)
+    SELECT id, val FROM sorted_merge_dropcol ORDER BY id LIMIT 5');
+
+DROP TABLE sorted_merge_dropcol;
+
+-- Q4: Zero-output-column SELECT — Postgres allows SELECT FROM t
+-- (no target list), and so does Citus.  Sorted merge must not crash.
+SELECT FROM sorted_merge_test ORDER BY id LIMIT 5;
+
+-- Q5: LIMIT 0 — empty result set, exercises the perTaskStoreCount==0
+-- early return in FinalizeSortedMerge.
+SELECT id FROM sorted_merge_test ORDER BY id LIMIT 0;
+SELECT id, val, num FROM sorted_merge_test ORDER BY id, val LIMIT 0;
+
+-- Q6: Single-shard distributed table — only one task to merge, so the
+-- plan is effectively a passthrough; verifies no crash and correct
+-- output for the K=1 corner case.
+CREATE TABLE sorted_merge_single (id int, val text);
+SET citus.shard_count TO 1;
+SELECT create_distributed_table('sorted_merge_single', 'id');
+RESET citus.shard_count;
+
+INSERT INTO sorted_merge_single
+SELECT i, 'v_' || i FROM generate_series(1, 10) i;
+
+SELECT id, val FROM sorted_merge_single ORDER BY id, val;
+SELECT id FROM sorted_merge_single ORDER BY id LIMIT 3;
+
+SELECT public.explain_filter('EXPLAIN (COSTS OFF, VERBOSE OFF)
+    SELECT id, val FROM sorted_merge_single ORDER BY id, val');
+
+DROP TABLE sorted_merge_single;
 
 SET citus.enable_sorted_merge TO off;
 
