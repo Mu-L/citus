@@ -79,41 +79,6 @@ static int MergeHeapComparator(Datum a, Datum b, void *arg);
 
 
 /*
- * BuildSortedMergeKeys constructs an array of SortedMergeKey from a sort clause
- * list and its corresponding target list. The resulting keys are used by the
- * executor to set up SortSupport structures for the k-way merge.
- *
- * The attribute numbers in the keys correspond to worker output column positions,
- * which align with the 1-based non-junk ordering of the worker target list.
- */
-SortedMergeKey *
-BuildSortedMergeKeys(List *sortClauseList, List *targetList, int *nkeys)
-{
-	*nkeys = list_length(sortClauseList);
-	if (*nkeys == 0)
-	{
-		return NULL;
-	}
-
-	SortedMergeKey *keys = palloc(*nkeys * sizeof(SortedMergeKey));
-
-	int i = 0;
-	SortGroupClause *sgc = NULL;
-	foreach_declared_ptr(sgc, sortClauseList)
-	{
-		TargetEntry *tle = get_sortgroupclause_tle(sgc, targetList);
-		keys[i].attno = tle->resno;
-		keys[i].sortop = sgc->sortop;
-		keys[i].collation = exprCollation((Node *) tle->expr);
-		keys[i].nullsFirst = sgc->nulls_first;
-		i++;
-	}
-
-	return keys;
-}
-
-
-/*
  * CreatePerTaskDispatchDests creates one tuple store per task, sets
  * task->tupleDest to a TupleStoreTupleDest that writes directly to that
  * store, and attaches a SortedMergeAdapter to scanState->mergeAdapter so
@@ -193,12 +158,14 @@ CreatePerTaskDispatchDests(CitusScanState *scanState)
 	 * scaffolding; lazy seeding (reading the first tuple from each store)
 	 * happens on the first fetch from SortedMergeAdapterNext, after the
 	 * workers have filled the stores.
+	 *
+	 * Build SortSupport directly from the worker query's sort clause —
+	 * each SortGroupClause maps onto one SortSupportData entry without
+	 * needing an intermediate type. Attribute numbers come from the
+	 * worker target list and align with the 1-based non-junk ordering of
+	 * the per-task tuplestore output.
 	 */
-	int sortedMergeKeyCount = 0;
-	SortedMergeKey *sortedMergeKeys =
-		BuildSortedMergeKeys(workerJob->jobQuery->sortClause,
-							 workerJob->jobQuery->targetList,
-							 &sortedMergeKeyCount);
+	int nkeys = list_length(workerJob->jobQuery->sortClause);
 
 	/*
 	 * The plan-time eligibility gate guarantees we have at least one sort
@@ -206,7 +173,7 @@ CreatePerTaskDispatchDests(CitusScanState *scanState)
 	 * release builds: a zero-key adapter would crash later in
 	 * PrepareSortSupportFromOrderingOp / ApplySortComparator.
 	 */
-	if (sortedMergeKeyCount == 0)
+	if (nkeys == 0)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -215,10 +182,26 @@ CreatePerTaskDispatchDests(CitusScanState *scanState)
 						 "Disable citus.enable_sorted_merge as a workaround.")));
 	}
 
+	SortSupportData *sortKeys = palloc0(nkeys * sizeof(SortSupportData));
+	int k = 0;
+	SortGroupClause *sgc = NULL;
+	foreach_declared_ptr(sgc, workerJob->jobQuery->sortClause)
+	{
+		TargetEntry *tle =
+			get_sortgroupclause_tle(sgc, workerJob->jobQuery->targetList);
+		SortSupport sk = &sortKeys[k];
+		sk->ssup_cxt = CurrentMemoryContext;
+		sk->ssup_collation = exprCollation((Node *) tle->expr);
+		sk->ssup_nulls_first = sgc->nulls_first;
+		sk->ssup_attno = tle->resno;
+		PrepareSortSupportFromOrderingOp(sgc->sortop, sk);
+		k++;
+	}
+
 	scanState->mergeAdapter = CreateSortedMergeAdapter(perTaskStores,
 													   taskCount,
-													   sortedMergeKeys,
-													   sortedMergeKeyCount,
+													   sortKeys,
+													   nkeys,
 													   tupleDesc,
 													   true);
 }
@@ -288,18 +271,20 @@ MergeHeapComparator(Datum a, Datum b, void *arg)
 
 /*
  * CreateSortedMergeAdapter builds a streaming merge adapter over K per-task
- * stores. When ownsStores is true, FreeSortedMergeAdapter() will call
- * tuplestore_end() on each per-task store; when false, the caller retains
- * ownership and must free them separately.
+ * stores using a caller-supplied array of fully-initialized SortSupportData
+ * keys (one per sort column). When ownsStores is true, FreeSortedMergeAdapter()
+ * will call tuplestore_end() on each per-task store; when false, the caller
+ * retains ownership and must free them separately.
  *
  * All memory is allocated in CurrentMemoryContext. The caller must ensure
  * this context outlives the adapter (the AdaptiveExecutor local context
- * already satisfies this — see adaptive_executor.c).
+ * already satisfies this — see adaptive_executor.c). The sortKeys array is
+ * adopted by the adapter and freed alongside it.
  */
 SortedMergeAdapter *
 CreateSortedMergeAdapter(Tuplestorestate **perTaskStores,
 						 int nstores,
-						 SortedMergeKey *mergeKeys,
+						 SortSupportData *sortKeys,
 						 int nkeys,
 						 TupleDesc tupleDesc,
 						 bool ownsStores)
@@ -315,18 +300,6 @@ CreateSortedMergeAdapter(Tuplestorestate **perTaskStores,
 	for (int i = 0; i < nstores; i++)
 	{
 		slots[i] = MakeSingleTupleTableSlot(tupleDesc, &TTSOpsMinimalTuple);
-	}
-
-	/* build SortSupport from serialized merge keys */
-	SortSupportData *sortKeys = palloc0(nkeys * sizeof(SortSupportData));
-	for (int i = 0; i < nkeys; i++)
-	{
-		SortSupport sk = &sortKeys[i];
-		sk->ssup_cxt = CurrentMemoryContext;
-		sk->ssup_collation = mergeKeys[i].collation;
-		sk->ssup_nulls_first = mergeKeys[i].nullsFirst;
-		sk->ssup_attno = mergeKeys[i].attno;
-		PrepareSortSupportFromOrderingOp(mergeKeys[i].sortop, sk);
 	}
 
 	/* set up embedded merge context for heap comparisons */

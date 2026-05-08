@@ -12,6 +12,7 @@
 #define SORTED_MERGE_H
 
 #include "access/tupdesc.h"
+#include "utils/sortsupport.h"
 #include "utils/tuplestore.h"
 
 #include "distributed/citus_custom_scan.h"
@@ -23,29 +24,12 @@
 typedef struct SortedMergeAdapter SortedMergeAdapter;
 
 
-/*
- * SortedMergeKey describes one sort key for the coordinator-side
- * k-way merge of pre-sorted worker results. The executor uses these
- * to build SortSupport structures for the merge.
- */
-typedef struct SortedMergeKey
-{
-	AttrNumber attno;       /* 1-based attribute in the worker output */
-	Oid sortop;             /* ordering operator OID */
-	Oid collation;          /* collation OID */
-	bool nullsFirst;        /* NULLS FIRST? */
-} SortedMergeKey;
-
-
-extern SortedMergeKey * BuildSortedMergeKeys(List *sortClauseList,
-											 List *targetList, int *nkeys);
-
 extern void CreatePerTaskDispatchDests(CitusScanState *scanState);
 extern void ClearPerTaskDispatchDests(CitusScanState *scanState);
 
 extern SortedMergeAdapter * CreateSortedMergeAdapter(Tuplestorestate **perTaskStores,
 													 int nstores,
-													 SortedMergeKey *mergeKeys,
+													 SortSupportData *sortKeys,
 													 int nkeys,
 													 TupleDesc tupleDesc,
 													 bool ownsStores);
