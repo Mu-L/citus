@@ -74,6 +74,12 @@ static DistributedPlan * CopyDistributedPlanWithoutCache(DistributedPlan *
 														 originalDistributedPlan);
 static void CitusEndScan(CustomScanState *node);
 static void CitusReScan(CustomScanState *node);
+static TupleTableSlot * SortedMergeExecScan(CustomScanState *node);
+static void SortedMergeEndScan(CustomScanState *node);
+static void SortedMergeReScan(CustomScanState *node);
+static void CitusExecScanCommon(CitusScanState *scanState);
+static void CitusEndScanCommon(CitusScanState *scanState);
+static void CitusReScanCommon(CustomScanState *node);
 static void EnsureForceDelegationDistributionKey(Job *job);
 static void EnsureAnchorShardsInJobExist(Job *job);
 static bool AnchorShardsInTaskListExist(List *taskList);
@@ -136,6 +142,24 @@ static CustomExecMethods NonPushableMergeCommandCustomExecMethods = {
 
 
 /*
+ * Sorted-merge plans use a dedicated set of methods so the per-row scan
+ * fetch path doesn't have to branch on whether a streaming merge adapter
+ * is attached. SortedMergeExecScan dispatches directly to
+ * ReturnTupleFromSortedMerge; SortedMergeEndScan and SortedMergeReScan
+ * unconditionally drive the adapter (no NULL checks needed because the
+ * adapter is always installed for plans that pick these methods).
+ */
+static CustomExecMethods SortedMergeCustomExecMethods = {
+	.CustomName = "SortedMergeAdaptiveExecutorScan",
+	.BeginCustomScan = CitusBeginScan,
+	.ExecCustomScan = SortedMergeExecScan,
+	.EndCustomScan = SortedMergeEndScan,
+	.ReScanCustomScan = SortedMergeReScan,
+	.ExplainCustomScan = CitusExplainScan
+};
+
+
+/*
  * IsCitusCustomState returns if a given PlanState node is a CitusCustomState node.
  */
 bool
@@ -148,6 +172,7 @@ IsCitusCustomState(PlanState *planState)
 
 	CustomScanState *css = castNode(CustomScanState, planState);
 	if (css->methods == &AdaptiveExecutorCustomExecMethods ||
+		css->methods == &SortedMergeCustomExecMethods ||
 		css->methods == &NonPushableInsertSelectCustomExecMethods ||
 		css->methods == &NonPushableMergeCommandCustomExecMethods)
 	{
@@ -255,36 +280,58 @@ CitusPreExecScan(CitusScanState *scanState)
 
 
 /*
- * CitusExecScan is called when a tuple is pulled from a custom scan.
- * On the first call, it executes the distributed query and writes the
- * results to a tuple store. The postgres executor calls this function
- * repeatedly to read tuples from the tuple store.
+ * CitusExecScanCommon performs the first-call work shared by all Citus
+ * custom-scan ExecCustomScan callbacks: it runs the distributed query
+ * (filling the tuplestore or per-task stores attached to the streaming
+ * merge adapter), increments the multi/single-shard query counter, and
+ * marks the remote scan as finished. Subsequent calls are no-ops.
+ *
+ * Variant-specific tuple delivery (ReturnTupleFromTuplestore vs
+ * ReturnTupleFromSortedMerge) is left to each caller.
+ */
+static void
+CitusExecScanCommon(CitusScanState *scanState)
+{
+	if (scanState->finishedRemoteScan)
+	{
+		return;
+	}
+
+	bool isMultiTaskPlan = IsMultiTaskPlan(scanState->distributedPlan);
+
+	AdaptiveExecutor(scanState);
+
+	if (!scanState->distributedPlan->disableTrackingQueryCounters)
+	{
+		if (isMultiTaskPlan)
+		{
+			IncrementStatCounterForMyDb(STAT_QUERY_EXECUTION_MULTI_SHARD);
+		}
+		else
+		{
+			IncrementStatCounterForMyDb(STAT_QUERY_EXECUTION_SINGLE_SHARD);
+		}
+	}
+
+	scanState->finishedRemoteScan = true;
+}
+
+
+/*
+ * CitusExecScan is called when a tuple is pulled from a non-sorted-merge
+ * Citus custom scan. On the first call, it executes the distributed
+ * query and fills the scan's tuplestore. The postgres executor calls
+ * this function repeatedly to read tuples from the tuplestore.
+ *
+ * Sorted-merge plans use SortedMergeExecScan and never reach this
+ * function.
  */
 TupleTableSlot *
 CitusExecScan(CustomScanState *node)
 {
 	CitusScanState *scanState = (CitusScanState *) node;
 
-	if (!scanState->finishedRemoteScan)
-	{
-		bool isMultiTaskPlan = IsMultiTaskPlan(scanState->distributedPlan);
-
-		AdaptiveExecutor(scanState);
-
-		if (!scanState->distributedPlan->disableTrackingQueryCounters)
-		{
-			if (isMultiTaskPlan)
-			{
-				IncrementStatCounterForMyDb(STAT_QUERY_EXECUTION_MULTI_SHARD);
-			}
-			else
-			{
-				IncrementStatCounterForMyDb(STAT_QUERY_EXECUTION_SINGLE_SHARD);
-			}
-		}
-
-		scanState->finishedRemoteScan = true;
-	}
+	CitusExecScanCommon(scanState);
 
 	return ReturnTupleFromTuplestore(scanState);
 }
@@ -709,6 +756,9 @@ RegenerateTaskForFasthPathQuery(Job *workerJob)
 
 /*
  * AdaptiveExecutorCreateScan creates the scan state for the adaptive executor.
+ *
+ * Sorted-merge plans get a dedicated set of CustomExecMethods that bypass
+ * the per-row mergeAdapter-vs-tuplestore branch in the default scan path.
  */
 static Node *
 AdaptiveExecutorCreateScan(CustomScan *scan)
@@ -719,7 +769,14 @@ AdaptiveExecutorCreateScan(CustomScan *scan)
 	scanState->customScanState.ss.ps.type = T_CustomScanState;
 	scanState->distributedPlan = GetDistributedPlan(scan);
 
-	scanState->customScanState.methods = &AdaptiveExecutorCustomExecMethods;
+	if (scanState->distributedPlan->useSortedMerge)
+	{
+		scanState->customScanState.methods = &SortedMergeCustomExecMethods;
+	}
+	else
+	{
+		scanState->customScanState.methods = &AdaptiveExecutorCustomExecMethods;
+	}
 	scanState->PreExecScan = &CitusPreExecScan;
 
 	scanState->finishedPreScan = false;
@@ -794,12 +851,14 @@ NonPushableMergeCommandCreateScan(CustomScan *scan)
 
 
 /*
- * CitusEndScan is used to clean up tuple store of the given custom scan state.
+ * CitusEndScanCommon performs cleanup work shared by all Citus custom-scan
+ * EndScan callbacks: it stops worker-notice propagation, surfaces deferred
+ * worker errors, and records executor stats. Variant-specific cleanup
+ * (tuplestore_end vs FreeSortedMergeAdapter) is left to each caller.
  */
 static void
-CitusEndScan(CustomScanState *node)
+CitusEndScanCommon(CitusScanState *scanState)
 {
-	CitusScanState *scanState = (CitusScanState *) node;
 	Job *workerJob = scanState->distributedPlan->workerJob;
 	uint64 queryId = scanState->distributedPlan->queryId;
 	MultiExecutorType executorType = scanState->executorType;
@@ -835,12 +894,21 @@ CitusEndScan(CustomScanState *node)
 		/* queries without partition key are also recorded */
 		CitusQueryStatsExecutorsEntry(queryId, executorType, partitionKeyString);
 	}
+}
 
-	if (scanState->mergeAdapter)
-	{
-		FreeSortedMergeAdapter(scanState->mergeAdapter);
-		scanState->mergeAdapter = NULL;
-	}
+
+/*
+ * CitusEndScan is used to clean up tuple store of the given custom scan state.
+ *
+ * Sorted-merge plans use SortedMergeEndScan instead and never reach this
+ * function.
+ */
+static void
+CitusEndScan(CustomScanState *node)
+{
+	CitusScanState *scanState = (CitusScanState *) node;
+
+	CitusEndScanCommon(scanState);
 
 	if (scanState->tuplestorestate)
 	{
@@ -851,25 +919,96 @@ CitusEndScan(CustomScanState *node)
 
 
 /*
- * CitusReScan is not normally called, except in certain cases of
- * DECLARE .. CURSOR WITH HOLD ..
+ * SortedMergeExecScan is the per-row callback for sorted-merge plans.
+ * On the first call CitusExecScanCommon runs the distributed query
+ * (filling the per-task tuple stores attached to the streaming merge
+ * adapter); subsequent calls just pull globally-sorted tuples directly
+ * from the adapter via ReturnTupleFromSortedMerge.
+ */
+static TupleTableSlot *
+SortedMergeExecScan(CustomScanState *node)
+{
+	CitusScanState *scanState = (CitusScanState *) node;
+
+	CitusExecScanCommon(scanState);
+
+	return ReturnTupleFromSortedMerge(scanState);
+}
+
+
+/*
+ * SortedMergeEndScan is the cleanup callback for sorted-merge plans. It
+ * shares the notice / stats / error-check work with CitusEndScan via
+ * CitusEndScanCommon, and then unconditionally frees the streaming merge
+ * adapter — there is no NULL check because the adapter is always installed
+ * by CreatePerTaskDispatchDests for plans that select these methods.
  */
 static void
-CitusReScan(CustomScanState *node)
+SortedMergeEndScan(CustomScanState *node)
+{
+	CitusScanState *scanState = (CitusScanState *) node;
+
+	CitusEndScanCommon(scanState);
+
+	FreeSortedMergeAdapter(scanState->mergeAdapter);
+	scanState->mergeAdapter = NULL;
+}
+
+
+/*
+ * SortedMergeReScan is the rescan callback for sorted-merge plans. PG only
+ * reaches this path when ExecutorRewind() runs (e.g., during
+ * PersistHoldablePortal for a SCROLL CURSOR WITH HOLD that has been
+ * partially fetched), and only when nothing above us has absorbed the
+ * rescan. In production our Material insertion in distributed_planner.c
+ * absorbs the rescan; this callback is reachable only by removing that
+ * insertion.
+ */
+static void
+SortedMergeReScan(CustomScanState *node)
+{
+	elog(WARNING, "unexpected sorted merge rescan");
+
+	CitusReScanCommon(node);
+
+	CitusScanState *scanState = (CitusScanState *) node;
+	SortedMergeAdapterRescan(scanState->mergeAdapter);
+}
+
+
+/*
+ * CitusReScanCommon resets the executor scan state shared by every Citus
+ * custom-scan ReScanCustomScan callback: it clears the result tuple slot
+ * and runs the standard ExecScanReScan housekeeping. Variant-specific
+ * rewind work (tuplestore_rescan vs SortedMergeAdapterRescan) is left to
+ * each caller.
+ */
+static void
+CitusReScanCommon(CustomScanState *node)
 {
 	if (node->ss.ps.ps_ResultTupleSlot)
 	{
 		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 	}
 	ExecScanReScan(&node->ss);
+}
+
+
+/*
+ * CitusReScan is not normally called, except in certain cases of
+ * DECLARE .. CURSOR WITH HOLD ..
+ *
+ * Sorted-merge plans use SortedMergeReScan instead and never reach this
+ * function.
+ */
+static void
+CitusReScan(CustomScanState *node)
+{
+	CitusReScanCommon(node);
 
 	CitusScanState *scanState = (CitusScanState *) node;
 
-	if (scanState->mergeAdapter)
-	{
-		SortedMergeAdapterRescan(scanState->mergeAdapter);
-	}
-	else if (scanState->tuplestorestate)
+	if (scanState->tuplestorestate)
 	{
 		tuplestore_rescan(scanState->tuplestorestate);
 	}

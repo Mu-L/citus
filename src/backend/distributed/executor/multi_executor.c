@@ -344,69 +344,20 @@ CitusCustomScanStateWalker(PlanState *planState, List **citusCustomScanStates)
 
 
 /*
- * FetchNextScanTuple returns the next tuple from the scan source.
- *
- * When a merge adapter is active, the returned slot is owned by the adapter.
- * Otherwise, tuples are read into and returned from the provided scan slot.
- */
-static inline TupleTableSlot *
-FetchNextScanTuple(CitusScanState *scanState, bool forward, TupleTableSlot *slot)
-{
-	if (scanState->mergeAdapter != NULL)
-	{
-		/*
-		 * The streaming merge adapter is forward-only.
-		 *
-		 * Citus replaces the entire plan tree after standard_planner()
-		 * returns, so PostgreSQL's cursor-time materialize_finished_plan()
-		 * check does not see the Citus CustomScan. That means SCROLL
-		 * cursors can reach here with a backward scan request even though
-		 * the adapter cannot satisfy it. Report a user-facing error
-		 * rather than crashing.
-		 */
-		if (unlikely(!forward))
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("streaming sorted merge does not support "
-							"backward scan"),
-					 errhint("Declare the cursor with SCROLL to enable "
-							 "backward scan.")));
-		}
-
-		TupleTableSlot *adapterSlot =
-			SortedMergeAdapterNext(scanState->mergeAdapter);
-		if (adapterSlot == NULL)
-		{
-			return ExecClearTuple(slot);
-		}
-		return adapterSlot;
-	}
-
-	Tuplestorestate *tupleStore = scanState->tuplestorestate;
-	if (tupleStore == NULL)
-	{
-		return ExecClearTuple(slot);
-	}
-
-	if (!tuplestore_gettupleslot(tupleStore, forward, false, slot))
-	{
-		return ExecClearTuple(slot);
-	}
-
-	return slot;
-}
-
-
-/*
- * ReturnTupleFromTuplestore reads the next tuple from the tuple store (or
- * streaming merge adapter) of the given Citus scan node and returns it.
- * It returns null if all tuples are read.
+ * ReturnTupleFromTuplestore reads the next tuple from the tuple store of the
+ * given Citus scan node and returns it. It returns null if all tuples are read
+ * from the tuple store.
  */
 TupleTableSlot *
 ReturnTupleFromTuplestore(CitusScanState *scanState)
 {
+	Tuplestorestate *tupleStore = scanState->tuplestorestate;
 	bool forwardScanDirection = true;
+
+	if (tupleStore == NULL)
+	{
+		return NULL;
+	}
 
 	EState *executorState = ScanStateGetExecutorState(scanState);
 	ScanDirection scanDirection = executorState->es_direction;
@@ -423,9 +374,10 @@ ReturnTupleFromTuplestore(CitusScanState *scanState)
 
 	if (!qual && !projInfo)
 	{
-		/* no quals, nor projections return directly from the tuple source. */
+		/* no quals, nor projections return directly from the tuple store. */
 		TupleTableSlot *slot = scanState->customScanState.ss.ss_ScanTupleSlot;
-		return FetchNextScanTuple(scanState, forwardScanDirection, slot);
+		tuplestore_gettupleslot(tupleStore, forwardScanDirection, false, slot);
+		return slot;
 	}
 
 	for (;;)
@@ -443,11 +395,12 @@ ReturnTupleFromTuplestore(CitusScanState *scanState)
 		ResetExprContext(econtext);
 
 		TupleTableSlot *slot = scanState->customScanState.ss.ss_ScanTupleSlot;
-		slot = FetchNextScanTuple(scanState, forwardScanDirection, slot);
+		tuplestore_gettupleslot(tupleStore, forwardScanDirection, false, slot);
+
 		if (TupIsNull(slot))
 		{
 			/*
-			 * When the tuple is null we have reached the end of the source. We will
+			 * When the tuple is null we have reached the end of the tuplestore. We will
 			 * return a null tuple, however, depending on the existence of a projection we
 			 * need to either return the scan tuple or the projected tuple.
 			 */
@@ -483,6 +436,96 @@ ReturnTupleFromTuplestore(CitusScanState *scanState)
 		else
 		{
 			/* Here, we aren't projecting, so just return scan tuple */
+			return slot;
+		}
+	}
+}
+
+
+/*
+ * ReturnTupleFromSortedMerge reads the next globally-sorted tuple from the
+ * scan's streaming merge adapter and returns it. The adapter is forward-only
+ * — sorted-merge plans drop CUSTOMPATH_SUPPORT_BACKWARD_SCAN at plan time and
+ * insert a Material absorber for SCROLL cursors, so a backward scan request
+ * here is a planner-invariant violation.
+ *
+ * The adapter owns the returned slot. Sorted-merge ExecCustomScan dispatches
+ * directly here.
+ */
+TupleTableSlot *
+ReturnTupleFromSortedMerge(CitusScanState *scanState)
+{
+	Assert(ScanDirectionIsForward(
+			   ScanStateGetExecutorState(scanState)->es_direction));
+
+	ExprState *qual = scanState->customScanState.ss.ps.qual;
+	ProjectionInfo *projInfo = scanState->customScanState.ss.ps.ps_ProjInfo;
+	ExprContext *econtext = scanState->customScanState.ss.ps.ps_ExprContext;
+
+	if (!qual && !projInfo)
+	{
+		/* fast path: no quals, no projection — return adapter slot directly */
+		TupleTableSlot *slot = SortedMergeAdapterNext(scanState->mergeAdapter);
+		if (slot == NULL)
+		{
+			return ExecClearTuple(scanState->customScanState.ss.ss_ScanTupleSlot);
+		}
+		scanState->customScanState.ss.ss_ScanTupleSlot = slot;
+		return slot;
+	}
+
+	for (;;)
+	{
+		/*
+		 * If there is a very selective qual on the Citus Scan node we might block
+		 * interrupts for a longer time if we would not check for interrupts in this loop
+		 */
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Reset per-tuple memory context to free any expression evaluation
+		 * storage allocated in the previous tuple cycle.
+		 */
+		ResetExprContext(econtext);
+
+		TupleTableSlot *slot = SortedMergeAdapterNext(scanState->mergeAdapter);
+		if (slot == NULL)
+		{
+			/*
+			 * When the tuple is null we have reached the end of the tuplestore. We will
+			 * return a null tuple, however, depending on the existence of a projection we
+			 * need to either return the scan tuple or the projected tuple.
+			 */			
+			if (projInfo)
+			{
+				return ExecClearTuple(projInfo->pi_state.resultslot);
+			}
+			return ExecClearTuple(scanState->customScanState.ss.ss_ScanTupleSlot);
+		}
+
+		/* place the current tuple into the expr context */
+		econtext->ecxt_scantuple = slot;
+
+		if (!ExecQual(qual, econtext))
+		{
+			/* skip nodes that do not satisfy the qual (filter) */
+			InstrCountFiltered1(scanState, 1);
+			continue;
+		}
+
+		/* found a satisfactory scan tuple */
+		if (projInfo)
+		{
+			/*
+			 * Form a projection tuple, store it in the result tuple slot and return it.
+			 * ExecProj works on the ecxt_scantuple on the context stored earlier.
+			 */
+			return ExecProject(projInfo);
+		}
+		else
+		{
+			/* Here, we aren't projecting, so just return scan tuple */
+			scanState->customScanState.ss.ss_ScanTupleSlot = slot;
 			return slot;
 		}
 	}
