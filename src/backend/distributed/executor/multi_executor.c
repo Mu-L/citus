@@ -495,7 +495,7 @@ ReturnTupleFromSortedMerge(CitusScanState *scanState)
 			 * When the tuple is null we have reached the end of the tuplestore. We will
 			 * return a null tuple, however, depending on the existence of a projection we
 			 * need to either return the scan tuple or the projected tuple.
-			 */			
+			 */
 			if (projInfo)
 			{
 				return ExecClearTuple(projInfo->pi_state.resultslot);
