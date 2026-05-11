@@ -966,9 +966,7 @@ SortedMergeExecScan(CustomScanState *node)
 /*
  * SortedMergeEndScan is the cleanup callback for sorted-merge plans. It
  * shares the notice / stats / error-check work with CitusEndScan via
- * CitusEndScanCommon, and then unconditionally frees the streaming merge
- * adapter — there is no NULL check because the adapter is always installed
- * by CreatePerTaskDispatchDests for plans that select these methods.
+ * CitusEndScanCommon.
  */
 static void
 SortedMergeEndScan(CustomScanState *node)

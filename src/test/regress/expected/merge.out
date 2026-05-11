@@ -3175,9 +3175,8 @@ WHEN NOT MATCHED THEN
    ->  Custom Scan (Citus Adaptive)
          ->  Distributed Subplan XXX_1
                ->  Limit
-                     ->  Custom Scan (Citus Adaptive)
+                     ->  Custom Scan (Citus Sorted Merge Adaptive)
                            Task Count: 4
-                           Merge Method: sorted merge
                            Tasks Shown: One of 4
                            ->  Task
                                  Node: host=localhost port=xxxxx dbname=regression
@@ -3204,7 +3203,7 @@ WHEN NOT MATCHED THEN
                      ->  Sort
                            Sort Key: intermediate_result_1.id2
                            ->  Function Scan on read_intermediate_result intermediate_result_1
-(34 rows)
+(33 rows)
 
 -- Test multiple join conditions on distribution column
 MERGE INTO demo_distributed t

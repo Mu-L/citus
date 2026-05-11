@@ -481,9 +481,8 @@ EXPLAIN (COSTS FALSE)
 	JOIN orders ON l_orderkey = o_orderkey AND l_quantity < 5.0
 	ORDER BY l_quantity LIMIT 10;
 Limit
-  ->  Custom Scan (Citus Adaptive)
+  ->  Custom Scan (Citus Sorted Merge Adaptive)
         Task Count: 2
-        Merge Method: sorted merge
         Tasks Shown: One of 2
         ->  Task
               Node: host=localhost port=xxxxx dbname=regression
@@ -965,9 +964,8 @@ ORDER BY
 LIMIT
 	10;
 Limit
-  ->  Custom Scan (Citus Adaptive)
+  ->  Custom Scan (Citus Sorted Merge Adaptive)
         Task Count: 4
-        Merge Method: sorted merge
         Tasks Shown: One of 4
         ->  Task
               Node: host=localhost port=xxxxx dbname=regression

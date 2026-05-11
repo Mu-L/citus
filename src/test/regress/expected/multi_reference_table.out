@@ -1581,7 +1581,7 @@ ORDER BY 1;
 $Q$) as "QUERY PLAN";
                                          QUERY PLAN
 ---------------------------------------------------------------------
- Custom Scan (Citus Adaptive)
+ Custom Scan (Citus Sorted Merge Adaptive)
    ->  Distributed Subplan XXX_1
          ->  Custom Scan (Citus Adaptive)
                Task Count: 1
@@ -1591,7 +1591,6 @@ $Q$) as "QUERY PLAN";
                      ->  Seq Scan on reference_table_test_1250000 rt
                            Filter: (value_2 = '2'::double precision)
    Task Count: 6
-   Merge Method: sorted merge
    Tasks Shown: One of 6
    ->  Task
          Node: host=localhost port=xxxxx dbname=regression
@@ -1604,7 +1603,7 @@ $Q$) as "QUERY PLAN";
                      ->  Result
                            One-Time Filter: ((InitPlan 1).col1 > '0'::double precision)
                            ->  Seq Scan on colocated_table_test_1250005 colocated_table_test
-(23 rows)
+(22 rows)
 
 WITH a as (SELECT rt.value_2 FROM reference_table_test rt where rt.value_2 = 2)
 SELECT ct.value_1, count(*) FROM colocated_table_test ct join a on ct.value_1 = a.value_2
