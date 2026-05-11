@@ -58,6 +58,7 @@ extern AllowedDistributionColumn AllowedDistributionColumnValue;
 
 /* functions for creating custom scan nodes */
 static Node * AdaptiveExecutorCreateScan(CustomScan *scan);
+static Node * SortedMergeCreateScan(CustomScan *scan);
 static Node * NonPushableInsertSelectCreateScan(CustomScan *scan);
 static Node * DelayedErrorCreateScan(CustomScan *scan);
 static Node * NonPushableMergeCommandCreateScan(CustomScan *scan);
@@ -91,6 +92,11 @@ static void CheckQueryDeparseSafety(Query *query);
 CustomScanMethods AdaptiveExecutorCustomScanMethods = {
 	"Citus Adaptive",
 	AdaptiveExecutorCreateScan
+};
+
+CustomScanMethods SortedMergeCustomScanMethods = {
+	"Citus Sorted Merge Adaptive",
+	SortedMergeCreateScan
 };
 
 CustomScanMethods NonPushableInsertSelectCustomScanMethods = {
@@ -190,6 +196,7 @@ void
 RegisterCitusCustomScanMethods(void)
 {
 	RegisterCustomScanMethods(&AdaptiveExecutorCustomScanMethods);
+	RegisterCustomScanMethods(&SortedMergeCustomScanMethods);
 	RegisterCustomScanMethods(&NonPushableInsertSelectCustomScanMethods);
 	RegisterCustomScanMethods(&DelayedErrorCustomScanMethods);
 	RegisterCustomScanMethods(&NonPushableMergeCommandCustomScanMethods);
@@ -756,9 +763,6 @@ RegenerateTaskForFasthPathQuery(Job *workerJob)
 
 /*
  * AdaptiveExecutorCreateScan creates the scan state for the adaptive executor.
- *
- * Sorted-merge plans get a dedicated set of CustomExecMethods that bypass
- * the per-row mergeAdapter-vs-tuplestore branch in the default scan path.
  */
 static Node *
 AdaptiveExecutorCreateScan(CustomScan *scan)
@@ -769,14 +773,37 @@ AdaptiveExecutorCreateScan(CustomScan *scan)
 	scanState->customScanState.ss.ps.type = T_CustomScanState;
 	scanState->distributedPlan = GetDistributedPlan(scan);
 
-	if (scanState->distributedPlan->useSortedMerge)
-	{
-		scanState->customScanState.methods = &SortedMergeCustomExecMethods;
-	}
-	else
-	{
-		scanState->customScanState.methods = &AdaptiveExecutorCustomExecMethods;
-	}
+	scanState->customScanState.methods = &AdaptiveExecutorCustomExecMethods;
+	scanState->PreExecScan = &CitusPreExecScan;
+
+	scanState->finishedPreScan = false;
+	scanState->finishedRemoteScan = false;
+
+	return (Node *) scanState;
+}
+
+
+/*
+ * SortedMergeCreateScan creates the scan state for sorted-merge plans.
+ *
+ * Sorted merge uses a dedicated CustomScan method set so that:
+ *   - EXPLAIN prints "Custom Scan (Citus Sorted Merge)" naturally, without
+ *     extra plumbing in multi_explain.c;
+ *   - the per-row Exec / End / ReScan callbacks (SortedMergeCustomExecMethods)
+ *     are installed up front, eliminating any mergeAdapter-vs-tuplestore
+ *     branch in the scan path;
+ *   - plan-time identification only requires looking at customScan->methods.
+ */
+static Node *
+SortedMergeCreateScan(CustomScan *scan)
+{
+	CitusScanState *scanState = palloc0(sizeof(CitusScanState));
+
+	scanState->executorType = MULTI_EXECUTOR_SORTED_MERGE;
+	scanState->customScanState.ss.ps.type = T_CustomScanState;
+	scanState->distributedPlan = GetDistributedPlan(scan);
+
+	scanState->customScanState.methods = &SortedMergeCustomExecMethods;
 	scanState->PreExecScan = &CitusPreExecScan;
 
 	scanState->finishedPreScan = false;

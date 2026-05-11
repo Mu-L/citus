@@ -15,7 +15,7 @@
  *	  before and after each execution via ClearPerTaskDispatchDests(); this
  *	  module does not retain pointers to Tasks beyond setup.
  *
- *	  FinalizeSortedMerge() builds a SortedMergeAdapter that performs a
+ *	  CreatePerTaskDispatchDests() builds a SortedMergeAdapter that performs a
  *	  k-way merge of the per-task stores using a binary heap and
  *	  PostgreSQL's SortSupport infrastructure, streaming one globally-sorted
  *	  tuple per call to the executor.

@@ -711,12 +711,6 @@ ExplainJob(CitusScanState *scanState, Job *job, ExplainState *es,
 
 	ExplainPropertyInteger("Task Count", NULL, taskCount, es);
 
-	DistributedPlan *distributedPlan = scanState->distributedPlan;
-	if (distributedPlan->useSortedMerge)
-	{
-		ExplainPropertyText("Merge Method", "sorted merge", es);
-	}
-
 	if (ShowReceivedTupleData(scanState, es))
 	{
 		Task *task = NULL;
