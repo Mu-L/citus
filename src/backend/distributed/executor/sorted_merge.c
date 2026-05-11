@@ -114,12 +114,6 @@ CreatePerTaskDispatchDests(CitusScanState *scanState)
 	List *taskList = workerJob->taskList;
 	TupleDesc tupleDesc = ScanStateGetTupleDescriptor(scanState);
 
-	int taskCount = list_length(taskList);
-	if (taskCount == 0)
-	{
-		return;
-	}
-
 	/*
 	 * Allocate per-task tuple stores. Each store gets work_mem / taskCount,
 	 * with a floor of 64 kB. Note: this means the aggregate in-memory budget
@@ -130,6 +124,7 @@ CreatePerTaskDispatchDests(CitusScanState *scanState)
 	 * adapter consumes them tuple-by-tuple, so the working set stays bounded.
 	 * The temporary memory amplification is bounded and short-lived.
 	 */
+	int taskCount = list_length(taskList);
 	Tuplestorestate **perTaskStores = palloc(taskCount * sizeof(Tuplestorestate *));
 	int perTaskWorkMem = Max(work_mem / Max(taskCount, 1), 64);
 
@@ -310,6 +305,12 @@ CreateSortedMergeAdapter(Tuplestorestate **perTaskStores,
 	/* allocate heap with embedded context as comparator arg */
 	adapter->heap = binaryheap_allocate(nstores, MergeHeapComparator,
 										&adapter->mergeCtx);
+	
+	if (nstores == 0)
+	{
+		adapter->initialized = true;
+		adapter->exhausted = true;
+	}
 
 	return adapter;
 }
@@ -392,7 +393,6 @@ SortedMergeAdapterNext(SortedMergeAdapter *adapter)
 void
 SortedMergeAdapterRescan(SortedMergeAdapter *adapter)
 {
-	/* TEMPORARY: confirm the rescan path is exercised by tests */
 	ereport(DEBUG2,
 			(errmsg("sorted merge: SortedMergeAdapterRescan invoked over %d stores",
 					adapter->nstores)));

@@ -470,7 +470,6 @@ ReturnTupleFromSortedMerge(CitusScanState *scanState)
 		{
 			return ExecClearTuple(scanState->customScanState.ss.ss_ScanTupleSlot);
 		}
-		scanState->customScanState.ss.ss_ScanTupleSlot = slot;
 		return slot;
 	}
 
@@ -525,7 +524,6 @@ ReturnTupleFromSortedMerge(CitusScanState *scanState)
 		else
 		{
 			/* Here, we aren't projecting, so just return scan tuple */
-			scanState->customScanState.ss.ss_ScanTupleSlot = slot;
 			return slot;
 		}
 	}

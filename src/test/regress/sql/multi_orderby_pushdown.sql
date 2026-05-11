@@ -1179,6 +1179,24 @@ SELECT public.explain_filter('EXPLAIN (COSTS OFF, VERBOSE OFF)
 
 DROP TABLE sorted_merge_single;
 
+-- Q7: Append-distributed table after TRUNCATE — the planner can produce
+-- a sorted-merge plan with an empty task list when all shards are
+-- pruned at execution time.  CreatePerTaskDispatchDests must still
+-- install a valid (empty) mergeAdapter so the scan returns 0 rows
+-- instead of dereferencing NULL.  Regression test for the post-TRUNCATE
+-- crash that previously segfaulted on PG16, PG17, and PG18.
+CREATE TABLE sorted_merge_append (id int, val text);
+SELECT create_distributed_table('sorted_merge_append', 'id', 'append');
+SELECT 1 FROM master_create_empty_shard('sorted_merge_append');
+
+INSERT INTO sorted_merge_append VALUES (0, 'a'), (1, 'b');
+SELECT id, val FROM sorted_merge_append ORDER BY id, val;
+
+TRUNCATE sorted_merge_append;
+SELECT id, val FROM sorted_merge_append ORDER BY id, val;
+
+DROP TABLE sorted_merge_append;
+
 SET citus.enable_sorted_merge TO off;
 
 -- =================================================================
