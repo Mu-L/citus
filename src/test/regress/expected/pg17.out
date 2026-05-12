@@ -40,9 +40,8 @@ WHERE x IN (SELECT x FROM test b UNION SELECT y FROM test c WHERE a.x = c.x)
 ORDER BY 1,2;
                               QUERY PLAN
 ---------------------------------------------------------------------
- Custom Scan (Citus Adaptive)
+ Custom Scan (Citus Sorted Merge Adaptive)
    Task Count: 2
-   Merge Method: sorted merge
    Tasks Shown: One of 2
    ->  Task
          Node: host=localhost port=xxxxx dbname=regression
@@ -58,7 +57,7 @@ ORDER BY 1,2;
                                        ->  Seq Scan on test_20240017 b
                                        ->  Seq Scan on test_20240017 c
                                              Filter: (a.x = x)
-(18 rows)
+(17 rows)
 
 SET client_min_messages TO DEBUG2;
 SELECT *
@@ -82,9 +81,8 @@ FROM test a JOIN LATERAL (SELECT x FROM test b UNION SELECT y FROM test c WHERE 
 ORDER BY 1,2;
                               QUERY PLAN
 ---------------------------------------------------------------------
- Custom Scan (Citus Adaptive)
+ Custom Scan (Citus Sorted Merge Adaptive)
    Task Count: 2
-   Merge Method: sorted merge
    Tasks Shown: One of 2
    ->  Task
          Node: host=localhost port=xxxxx dbname=regression
@@ -100,7 +98,7 @@ ORDER BY 1,2;
                                        ->  Seq Scan on test_20240017 b
                                        ->  Seq Scan on test_20240017 c
                                              Filter: (a.x = x)
-(18 rows)
+(17 rows)
 
 SET client_min_messages TO DEBUG2;
 SELECT a.*

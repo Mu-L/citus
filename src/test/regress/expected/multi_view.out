@@ -770,9 +770,8 @@ VACUUM ANALYZE users_table;
 EXPLAIN (COSTS FALSE) SELECT user_id FROM recent_selected_users GROUP BY 1 ORDER BY 1;
                                                               QUERY PLAN
 ---------------------------------------------------------------------
- Custom Scan (Citus Adaptive)
+ Custom Scan (Citus Sorted Merge Adaptive)
    Task Count: 4
-   Merge Method: sorted merge
    Tasks Shown: One of 4
    ->  Task
          Node: host=localhost port=xxxxx dbname=regression
@@ -790,7 +789,7 @@ EXPLAIN (COSTS FALSE) SELECT user_id FROM recent_selected_users GROUP BY 1 ORDER
                                        ->  Seq Scan on users_table_1400256 users_table_1
                            ->  Seq Scan on users_table_1400256 users_table
                                  Filter: ((value_1 >= 1) AND (value_1 < 3))
-(20 rows)
+(19 rows)
 
 SELECT public.coordinator_plan($Q$
 EXPLAIN (COSTS FALSE) SELECT *
@@ -801,9 +800,9 @@ EXPLAIN (COSTS FALSE) SELECT *
 	WHERE user_id < 4 AND user_id > 1
 	ORDER BY user_id;
 $Q$);
-       coordinator_plan
+             coordinator_plan
 ---------------------------------------------------------------------
- Custom Scan (Citus Adaptive)
+ Custom Scan (Citus Sorted Merge Adaptive)
    Task Count: 4
 (2 rows)
 
@@ -811,7 +810,7 @@ EXPLAIN (COSTS FALSE) SELECT et.* FROM recent_10_users JOIN events_table et USIN
                                                QUERY PLAN
 ---------------------------------------------------------------------
  Limit
-   ->  Custom Scan (Citus Adaptive)
+   ->  Custom Scan (Citus Sorted Merge Adaptive)
          ->  Distributed Subplan XXX_1
                ->  Limit
                      ->  Sort
@@ -828,7 +827,6 @@ EXPLAIN (COSTS FALSE) SELECT et.* FROM recent_10_users JOIN events_table et USIN
                                                          Group Key: user_id
                                                          ->  Seq Scan on users_table_1400256 users_table
          Task Count: 4
-         Merge Method: sorted merge
          Tasks Shown: One of 4
          ->  Task
                Node: host=localhost port=xxxxx dbname=regression
@@ -840,7 +838,7 @@ EXPLAIN (COSTS FALSE) SELECT et.* FROM recent_10_users JOIN events_table et USIN
                                  ->  Function Scan on read_intermediate_result intermediate_result
                                  ->  Hash
                                        ->  Seq Scan on events_table_1400260 et
-(30 rows)
+(29 rows)
 
 SET citus.subquery_pushdown to ON;
 NOTICE:  Setting citus.subquery_pushdown flag is discouraged becuase it forces the planner to pushdown certain queries, skipping relevant correctness checks.
@@ -849,9 +847,8 @@ EXPLAIN (COSTS FALSE) SELECT et.* FROM recent_10_users JOIN events_table et USIN
                                                   QUERY PLAN
 ---------------------------------------------------------------------
  Limit
-   ->  Custom Scan (Citus Adaptive)
+   ->  Custom Scan (Citus Sorted Merge Adaptive)
          Task Count: 4
-         Merge Method: sorted merge
          Tasks Shown: One of 4
          ->  Task
                Node: host=localhost port=xxxxx dbname=regression
@@ -869,7 +866,7 @@ EXPLAIN (COSTS FALSE) SELECT et.* FROM recent_10_users JOIN events_table et USIN
                                                          ->  HashAggregate
                                                                Group Key: users_table.user_id
                                                                ->  Seq Scan on users_table_1400256 users_table
-(21 rows)
+(20 rows)
 
 RESET citus.subquery_pushdown;
 DROP VIEW recent_10_users;
