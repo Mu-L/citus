@@ -305,7 +305,7 @@ CreateSortedMergeAdapter(Tuplestorestate **perTaskStores,
 	/* allocate heap with embedded context as comparator arg */
 	adapter->heap = binaryheap_allocate(nstores, MergeHeapComparator,
 										&adapter->mergeCtx);
-	
+
 	if (nstores == 0)
 	{
 		adapter->initialized = true;
