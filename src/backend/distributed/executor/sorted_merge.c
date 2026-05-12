@@ -104,8 +104,11 @@ static int MergeHeapComparator(Datum a, Datum b, void *arg);
  *     owns the stores and ends them via FreeSortedMergeAdapter, called
  *     from CitusEndScan when the scan terminates.
  *
- * No-op (mergeAdapter remains NULL) if the task list is empty — e.g. a
- * plan whose tasks were all pruned to no remote work.
+ * Always installs scanState->mergeAdapter, even when the task list is empty
+ * (e.g. a plan whose tasks were all pruned to no remote work — see Q7 in
+ * multi_orderby_pushdown.sql). The adapter degenerates to a zero-store
+ * heap that returns no tuples; SortedMergeExecScan still goes through the
+ * normal code path with no NULL checks required.
  */
 void
 CreatePerTaskDispatchDests(CitusScanState *scanState)

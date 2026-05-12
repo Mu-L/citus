@@ -912,7 +912,9 @@ CitusEndScanCommon(CitusScanState *scanState)
 	 */
 	if (queryId != 0)
 	{
-		if (partitionKeyConst != NULL && executorType == MULTI_EXECUTOR_ADAPTIVE)
+		if (partitionKeyConst != NULL &&
+			(executorType == MULTI_EXECUTOR_ADAPTIVE ||
+			 executorType == MULTI_EXECUTOR_SORTED_MERGE))
 		{
 			partitionKeyString = DatumToString(partitionKeyConst->constvalue,
 											   partitionKeyConst->consttype);

@@ -2959,7 +2959,7 @@ SET citus.enable_sorted_merge TO off;
 -- code path is active.  We test two mechanisms:
 --
 -- 1. Plain EXPLAIN ANALYZE: verifies plan structure (no coordinator
---    Sort node, "Merge Method: sorted merge" visible).
+--    Sort node, "Custom Scan (Citus Sorted Merge Adaptive)" visible).
 --
 -- 2. auto_explain with log_analyze: triggers the same executor code
 --    path (es_instrument != 0 → RequestedForExplainAnalyze() = true)
@@ -2970,8 +2970,8 @@ SET citus.enable_sorted_merge TO off;
 -- =================================================================
 SET citus.enable_sorted_merge TO on;
 -- Verify EXPLAIN ANALYZE plan structure: no Sort node at coordinator
--- level, "Merge Method: sorted merge" visible, and "actual rows"
--- confirms full execution through the merge path.
+-- level, "Custom Scan (Citus Sorted Merge Adaptive)" visible, and
+-- "actual rows" confirms full execution through the merge path.
 SELECT public.explain_filter('EXPLAIN (ANALYZE ON, VERBOSE ON, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF) SELECT id FROM sorted_merge_test ORDER BY id');
                                               explain_filter
 ---------------------------------------------------------------------
@@ -3324,7 +3324,8 @@ DEBUG:  sorted merge: per-task work_mem 64 kB × 4 tasks (aggregate floor 256 kB
 COMMIT;
 -- O1-EXPLAIN: Plans for the LIMIT 5 ASC/DESC cases under tight
 -- work_mem — confirms LIMIT pushdown is unaffected by the memory
--- setting and that "Merge Method: sorted merge" still appears.
+-- setting and that "Custom Scan (Citus Sorted Merge Adaptive)" still
+-- appears.
 BEGIN;
 SET LOCAL work_mem TO '64kB';
 SELECT public.explain_filter('EXPLAIN (COSTS OFF, VERBOSE OFF)
@@ -3384,7 +3385,8 @@ ORDER BY id;
 (5 rows)
 
 -- P2: EXPLAIN — for a global window, the coordinator Sort + WindowAgg
--- sits above a non-merging Citus scan (no "Merge Method: sorted merge").
+-- sits above a non-merging Citus scan (the plan node is "Custom Scan
+-- (Citus Adaptive)", not "Custom Scan (Citus Sorted Merge Adaptive)").
 -- This documents the planner's correct rejection of merge eligibility
 -- when a non-pushable window is present.
 SELECT public.explain_filter('EXPLAIN (COSTS OFF, VERBOSE OFF)
@@ -3494,7 +3496,7 @@ SELECT id, val FROM sorted_merge_target ORDER BY id, val;
 DROP TABLE sorted_merge_target;
 -- Q2: Router (single-shard) query — should bypass sorted merge.
 -- The SELECT runs on a single shard, so there is no k-way merge and
--- EXPLAIN must NOT show "Merge Method: sorted merge".
+-- EXPLAIN must NOT show "Custom Scan (Citus Sorted Merge Adaptive)".
 SELECT public.explain_filter('EXPLAIN (COSTS OFF, VERBOSE OFF)
     SELECT id, val FROM sorted_merge_test
     WHERE id = 1
@@ -3656,6 +3658,12 @@ DROP TABLE sorted_merge_single;
 -- install a valid (empty) mergeAdapter so the scan returns 0 rows
 -- instead of dereferencing NULL.  Regression test for the post-TRUNCATE
 -- crash that previously segfaulted on PG16, PG17, and PG18.
+--
+-- Note: TRUNCATE on an append-distributed table actually *drops* the
+-- shards rather than merely emptying them, so the post-TRUNCATE SELECT
+-- below runs with zero remote tasks (i.e. an empty task list reaches
+-- CreatePerTaskDispatchDests), which is precisely the scenario this
+-- test exercises.
 CREATE TABLE sorted_merge_append (id int, val text);
 SELECT create_distributed_table('sorted_merge_append', 'id', 'append');
  create_distributed_table
@@ -3684,6 +3692,125 @@ SELECT id, val FROM sorted_merge_append ORDER BY id, val;
 (0 rows)
 
 DROP TABLE sorted_merge_append;
+-- Q8: Error during query execution must not poison subsequent
+-- executions of the same prepared statement.  PostgreSQL switches a
+-- prepared statement to its cached generic plan after the 5th custom
+-- execution (G2a uses the same warmup pattern), so we EXECUTE the
+-- statement six times before forcing a timeout, then EXECUTE again
+-- afterward.  This proves both that:
+--   (a) the per-task stores / merge adapter were cleaned up correctly
+--       when the cached plan errored mid-flight, and
+--   (b) the cached generic plan itself remains usable.
+--
+-- The pg_sleep in the WHERE clause makes each row arrival visible to
+-- statement_timeout; LIMIT 3 keeps the warmup output compact while
+-- still exercising the per-task → merge → result-slot pipeline.
+PREPARE sorted_merge_ps AS
+    SELECT id, val FROM sorted_merge_test
+    WHERE pg_sleep(0.02) IS NOT NULL OR pg_sleep(0.02) IS NULL
+    ORDER BY id LIMIT 3;
+-- Warmup: 6 executions trigger PG's generic-plan caching.
+EXECUTE sorted_merge_ps;
+ id |  val
+---------------------------------------------------------------------
+  1 | val_1
+  2 | val_2
+  3 | val_3
+(3 rows)
+
+EXECUTE sorted_merge_ps;
+ id |  val
+---------------------------------------------------------------------
+  1 | val_1
+  2 | val_2
+  3 | val_3
+(3 rows)
+
+EXECUTE sorted_merge_ps;
+ id |  val
+---------------------------------------------------------------------
+  1 | val_1
+  2 | val_2
+  3 | val_3
+(3 rows)
+
+EXECUTE sorted_merge_ps;
+ id |  val
+---------------------------------------------------------------------
+  1 | val_1
+  2 | val_2
+  3 | val_3
+(3 rows)
+
+EXECUTE sorted_merge_ps;
+ id |  val
+---------------------------------------------------------------------
+  1 | val_1
+  2 | val_2
+  3 | val_3
+(3 rows)
+
+EXECUTE sorted_merge_ps;
+ id |  val
+---------------------------------------------------------------------
+  1 | val_1
+  2 | val_2
+  3 | val_3
+(3 rows)
+
+-- Confirm the cached plan is a sorted-merge custom scan (no Sort
+-- above it).
+EXPLAIN (COSTS OFF) EXECUTE sorted_merge_ps;
+                                                                 QUERY PLAN
+---------------------------------------------------------------------
+ Limit
+   ->  Custom Scan (Citus Sorted Merge Adaptive)
+         Task Count: 4
+         Tasks Shown: One of 4
+         ->  Task
+               Node: host=localhost port=xxxxx dbname=regression
+               ->  Limit
+                     ->  Sort
+                           Sort Key: id
+                           ->  Seq Scan on sorted_merge_test_960000 sorted_merge_test
+                                 Filter: ((pg_sleep('0.02'::double precision) IS NOT NULL) OR (pg_sleep('0.02'::double precision) IS NULL))
+(11 rows)
+
+-- Force a timeout mid-execution against the now-cached generic plan.
+-- 1ms is far shorter than the first pg_sleep(0.02 s) so the cancel
+-- fires reliably as soon as the first row is processed.
+SET statement_timeout = '1ms';
+DO $$
+BEGIN
+    EXECUTE 'EXECUTE sorted_merge_ps';
+EXCEPTION
+    WHEN query_canceled THEN
+        RAISE NOTICE 'expected timeout (canceling statement due to statement timeout)';
+    WHEN OTHERS THEN
+        RAISE NOTICE 'expected timeout (%)', SQLERRM;
+END$$;
+NOTICE:  expected timeout (canceling statement due to statement timeout)
+CONTEXT:  PL/pgSQL function inline_code_block line XX at RAISE
+RESET statement_timeout;
+-- Subsequent executions must reuse the cached generic plan and
+-- produce identical rows, proving error cleanup is correct.
+EXECUTE sorted_merge_ps;
+ id |  val
+---------------------------------------------------------------------
+  1 | val_1
+  2 | val_2
+  3 | val_3
+(3 rows)
+
+EXECUTE sorted_merge_ps;
+ id |  val
+---------------------------------------------------------------------
+  1 | val_1
+  2 | val_2
+  3 | val_3
+(3 rows)
+
+DEALLOCATE sorted_merge_ps;
 SET citus.enable_sorted_merge TO off;
 -- =================================================================
 -- Cleanup
